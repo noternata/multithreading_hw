@@ -13,6 +13,7 @@ void ApplyFunction(std::vector<T>& data,
 cmake -S . -B build
 cmake --build build  
 ```
+
 Результат запуска тестов:
 ```bash
 ./build/apply_function_tests
