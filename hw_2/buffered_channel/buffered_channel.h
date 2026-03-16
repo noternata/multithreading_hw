@@ -5,6 +5,7 @@
 #include <mutex>
 #include <condition_variable>
 #include <stdexcept>
+#include <utility>
 
 
 
@@ -41,7 +42,7 @@ public:
             return std::nullopt;
         }
 
-        T value = queue_.front();
+        T value = std::move(queue_.front());
         queue_.pop();
         not_full_.notify_one();
 
