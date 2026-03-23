@@ -49,8 +49,9 @@ public:
     }
     // освободить
     void unlock() {
-        if (state_.fetch_sub(1, std::memory_order_release) != LockedNoWaiters) {
-            state_.store(Unlocked, std::memory_order_release);
+        int old = state_.exchange(Unlocked, std::memory_order_release);
+
+        if (old == LockedWithWaiters) {
             FutexWake(&state_, 1);
         }
     }
