@@ -4,6 +4,7 @@
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#include <thread>
 
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -13,26 +14,41 @@
 namespace hw4 {
 namespace {
 
-std::size_t CalculateMappedSize(std::size_t slot_count) {
-    return sizeof(QueueHeader) + slot_count * sizeof(MessageSlot);
+std::size_t CalculateMappedSize(std::size_t buffer_size) {
+    return sizeof(QueueHeader) + buffer_size;
 }
 
-void BindPointers(void* mapping, QueueHeader*& header, MessageSlot*& slots) {
+void BindPointers(void* mapping, QueueHeader*& header, std::uint8_t*& buffer) {
     header = static_cast<QueueHeader*>(mapping);
-    slots = reinterpret_cast<MessageSlot*>(
-        static_cast<std::uint8_t*>(mapping) + sizeof(QueueHeader)
-    );
+    buffer = static_cast<std::uint8_t*>(mapping) + sizeof(QueueHeader);
 }
 
 std::runtime_error MakeError(const std::string& message) {
     return std::runtime_error(message + ": " + std::strerror(errno));
 }
 
+std::size_t MessageSize(std::size_t payload_size) {
+    return sizeof(MessageHeader) + payload_size;
+}
+
+void WriteHeader(std::uint8_t* ptr, std::uint32_t type, std::uint32_t length) {
+    MessageHeader header;
+    header.type = type;
+    header.length = length;
+    std::memcpy(ptr, &header, sizeof(header));
+}
+
+MessageHeader ReadHeader(const std::uint8_t* ptr) {
+    MessageHeader header{};
+    std::memcpy(&header, ptr, sizeof(header));
+    return header;
+}
+
 } // namespace
 
-ProducerNode::ProducerNode(const std::string& shm_name, std::size_t slot_count)
+ProducerNode::ProducerNode(const std::string& shm_name, std::size_t buffer_size)
     : shm_name_(shm_name) {
-    OpenOrCreate(slot_count);
+    OpenOrCreate(buffer_size);
 }
 
 ProducerNode::~ProducerNode() {
@@ -48,14 +64,15 @@ ConsumerNode::~ConsumerNode() {
     Close();
 }
 
-void ProducerNode::OpenOrCreate(std::size_t slot_count) {
-    if (slot_count == 0) {
-        throw std::runtime_error("slot_count must be greater than 0");
+void ProducerNode::OpenOrCreate(std::size_t buffer_size) {
+    if (buffer_size <= sizeof(MessageHeader)) {
+        throw std::runtime_error("buffer_size is too small");
     }
 
-    mapped_size_ = CalculateMappedSize(slot_count);
+    mapped_size_ = CalculateMappedSize(buffer_size);
 
     shm_unlink(shm_name_.c_str());
+
     fd_ = shm_open(shm_name_.c_str(), O_CREAT | O_RDWR, 0666);
     if (fd_ == -1) {
         throw MakeError("shm_open failed");
@@ -73,25 +90,16 @@ void ProducerNode::OpenOrCreate(std::size_t slot_count) {
         throw MakeError("mmap failed");
     }
 
-    BindPointers(mapping_, header_, slots_);
-
+    BindPointers(mapping_, header_, buffer_);
     std::memset(mapping_, 0, mapped_size_);
 
     header_->magic = kQueueMagic;
     header_->version = kProtocolVersion;
-    header_->slot_count = static_cast<std::uint32_t>(slot_count);
-    header_->max_payload_size = static_cast<std::uint32_t>(kMaxPayloadSize);
-    header_->write_index.store(0, std::memory_order_relaxed);
-    header_->read_index.store(0, std::memory_order_relaxed);
-
-    for (std::size_t i = 0; i < slot_count; ++i) {
-        slots_[i].state.store(
-            static_cast<std::uint32_t>(SlotState::Empty),
-            std::memory_order_relaxed
-        );
-        slots_[i].header.type = 0;
-        slots_[i].header.length = 0;
-    }
+    header_->buffer_size = static_cast<std::uint32_t>(buffer_size);
+    header_->reserved = 0;
+    header_->write_reserve.store(0, std::memory_order_relaxed);
+    header_->write_commit.store(0, std::memory_order_relaxed);
+    header_->read_offset.store(0, std::memory_order_relaxed);
 }
 
 void ConsumerNode::OpenExisting() {
@@ -120,7 +128,7 @@ void ConsumerNode::OpenExisting() {
         throw std::runtime_error("protocol version mismatch");
     }
 
-    mapped_size_ = CalculateMappedSize(header_->slot_count);
+    mapped_size_ = CalculateMappedSize(header_->buffer_size);
 
     if (munmap(mapping_, header_size) == -1) {
         Close();
@@ -134,7 +142,7 @@ void ConsumerNode::OpenExisting() {
         throw MakeError("mmap full queue failed");
     }
 
-    BindPointers(mapping_, header_, slots_);
+    BindPointers(mapping_, header_, buffer_);
 }
 
 void ProducerNode::Close() {
@@ -149,7 +157,7 @@ void ProducerNode::Close() {
     }
 
     header_ = nullptr;
-    slots_ = nullptr;
+    buffer_ = nullptr;
     mapped_size_ = 0;
 }
 
@@ -165,99 +173,116 @@ void ConsumerNode::Close() {
     }
 
     header_ = nullptr;
-    slots_ = nullptr;
+    buffer_ = nullptr;
     mapped_size_ = 0;
 }
 
 bool ProducerNode::Send(std::uint32_t type, const void* data, std::size_t size) {
+    if (type == kWrapMarkerType) {
+        return false;
+    }
+
     if (data == nullptr && size != 0) {
         return false;
     }
 
-    if (size > kMaxPayloadSize) {
+    const std::size_t record_size = MessageSize(size);
+    const std::size_t buffer_size = header_->buffer_size;
+
+    if (record_size > buffer_size - sizeof(MessageHeader)) {
         return false;
     }
 
-    const std::uint64_t logical_index =
-        header_->write_index.fetch_add(1, std::memory_order_relaxed);
+    std::uint64_t reserve_start = 0;
+    std::uint64_t reserve_end = 0;
+    bool need_wrap = false;
 
-    const std::size_t slot_index =
-        static_cast<std::size_t>(logical_index % header_->slot_count);
+    while (true) {
+        std::uint64_t current = header_->write_reserve.load(std::memory_order_relaxed);
+        const std::size_t pos = static_cast<std::size_t>(current % buffer_size);
 
-    MessageSlot& slot = slots_[slot_index];
+        need_wrap = (pos + record_size > buffer_size);
+        const std::size_t padding = need_wrap ? (buffer_size - pos) : 0;
+        const std::uint64_t next = current + padding + record_size;
 
-    while (slot.state.load(std::memory_order_acquire) !=
-           static_cast<std::uint32_t>(SlotState::Empty)) {
-        // active wait
+        const std::uint64_t read = header_->read_offset.load(std::memory_order_acquire);
+        if (next - read > buffer_size) {
+            std::this_thread::yield();
+            continue;
+        }
+
+        if (header_->write_reserve.compare_exchange_weak(
+                current,
+                next,
+                std::memory_order_acq_rel,
+                std::memory_order_relaxed)) {
+            reserve_start = current;
+            reserve_end = next;
+            break;
+        }
     }
 
-    slot.state.store(
-        static_cast<std::uint32_t>(SlotState::Writing),
-        std::memory_order_relaxed
-    );
+    std::size_t write_pos = static_cast<std::size_t>(reserve_start % buffer_size);
 
-    slot.header.type = type;
-    slot.header.length = static_cast<std::uint32_t>(size);
+    if (need_wrap) {
+        WriteHeader(buffer_ + write_pos, kWrapMarkerType, 0);
+        write_pos = 0;
+    }
 
+    WriteHeader(buffer_ + write_pos, type, static_cast<std::uint32_t>(size));
     if (size != 0) {
-        std::memcpy(slot.payload, data, size);
+        std::memcpy(buffer_ + write_pos + sizeof(MessageHeader), data, size);
     }
 
-    slot.state.store(
-        static_cast<std::uint32_t>(SlotState::Ready),
-        std::memory_order_release
-    );
+    while (header_->write_commit.load(std::memory_order_acquire) != reserve_start) {
+        std::this_thread::yield();
+    }
 
+    header_->write_commit.store(reserve_end, std::memory_order_release);
     return true;
 }
 
 bool ConsumerNode::Receive(std::uint32_t desired_type, ReceivedMessage& out_message) {
-    const std::uint64_t logical_index =
-        header_->read_index.load(std::memory_order_relaxed);
+    const std::size_t buffer_size = header_->buffer_size;
 
-    const std::size_t slot_index =
-        static_cast<std::size_t>(logical_index % header_->slot_count);
+    while (true) {
+        std::uint64_t read = header_->read_offset.load(std::memory_order_relaxed);
+        const std::uint64_t committed = header_->write_commit.load(std::memory_order_acquire);
 
-    MessageSlot& slot = slots_[slot_index];
-
-    if (slot.state.load(std::memory_order_acquire) !=
-        static_cast<std::uint32_t>(SlotState::Ready)) {
-        return false;
-    }
-
-    const std::uint32_t message_type = slot.header.type;
-    const std::uint32_t message_length = slot.header.length;
-
-    if (message_length > kMaxPayloadSize) {
-        slot.header.type = 0;
-        slot.header.length = 0;
-        slot.state.store(
-            static_cast<std::uint32_t>(SlotState::Empty),
-            std::memory_order_release
-        );
-        header_->read_index.fetch_add(1, std::memory_order_relaxed);
-        return false;
-    }
-
-    if (message_type == desired_type) {
-        out_message.type = message_type;
-        out_message.payload.resize(message_length);
-
-        if (message_length != 0) {
-            std::memcpy(out_message.payload.data(), slot.payload, message_length);
+        if (committed <= read) {
+            return false;
         }
+
+        std::size_t pos = static_cast<std::size_t>(read % buffer_size);
+        MessageHeader header = ReadHeader(buffer_ + pos);
+
+        if (header.type == kWrapMarkerType && header.length == 0) {
+            const std::uint64_t next = read + (buffer_size - pos);
+            header_->read_offset.store(next, std::memory_order_release);
+            continue;
+        }
+
+        const std::size_t record_size = MessageSize(header.length);
+        if (read + record_size > committed) {
+            return false;
+        }
+
+        if (header.type == desired_type) {
+            out_message.type = header.type;
+            out_message.payload.resize(header.length);
+
+            if (header.length != 0) {
+                std::memcpy(
+                    out_message.payload.data(),
+                    buffer_ + pos + sizeof(MessageHeader),
+                    header.length
+                );
+            }
+        }
+
+        header_->read_offset.store(read + record_size, std::memory_order_release);
+        return header.type == desired_type;
     }
-
-    slot.header.type = 0;
-    slot.header.length = 0;
-    slot.state.store(
-        static_cast<std::uint32_t>(SlotState::Empty),
-        std::memory_order_release
-    );
-
-    header_->read_index.fetch_add(1, std::memory_order_relaxed);
-
-    return message_type == desired_type;
 }
 
 } // namespace hw4

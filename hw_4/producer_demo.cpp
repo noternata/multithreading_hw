@@ -10,9 +10,9 @@
 int main() {
     try {
         const std::string shm_name = "/hw4_demo_queue";
-        const std::size_t slot_count = 8;
+        const std::size_t buffer_size = hw4::kDefaultBufferSize;
 
-        hw4::ProducerNode producer(shm_name, slot_count);
+    hw4::ProducerNode producer(shm_name, buffer_size);
 
         std::cout << "Producer started.\n";
         std::cout << "Queue created: " << shm_name << '\n';
